@@ -2,6 +2,10 @@
 
 A serverless web application for managing candidate profiles, designed for HR teams. This project demonstrates modern frontend development with **React** and leverages the **Supabase** ecosystem as a Backend-as-a-Service (BaaS), including Authentication, PostgreSQL, Storage, Realtime, and Edge Functions.
 
+## Live Demo
+
+**Application:** https://candidate-management-kappa.vercel.app/
+
 ## Tech Stack
 
 - **Frontend:** React, TypeScript, Vite, SCSS (CSS Modules), Mobile-First Responsive Design
