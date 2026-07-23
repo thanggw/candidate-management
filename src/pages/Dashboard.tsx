@@ -1,6 +1,6 @@
 import type { ChangeEvent, FormEvent } from "react";
 import type { RealtimePostgresChangesPayload } from "@supabase/supabase-js";
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { useAuth } from "../context/AuthContext";
 import { supabase } from "../lib/supabase";
 import styles from "./Dashboard.module.scss";
@@ -17,8 +17,26 @@ type Candidate = {
   created_at: string;
 };
 
+type CandidateCursor = Pick<Candidate, "created_at" | "id">;
+
 type AddCandidateResponse = {
   candidate?: Candidate;
+  error?: string;
+};
+
+type AnalyticsResponse = {
+  totalCandidates: number;
+  statusRatios: Array<{
+    status: CandidateStatus;
+    count: number;
+    ratio: number;
+  }>;
+  topPositions: Array<{
+    position: string;
+    count: number;
+  }>;
+  newestCandidates: Array<Pick<Candidate, "id" | "full_name" | "applied_position" | "created_at">>;
+  newestCandidatesCount: number;
   error?: string;
 };
 
@@ -40,11 +58,96 @@ const statusLabels: Record<CandidateStatus, string> = {
   hired: "Hired",
 };
 
-function sortCandidates(candidates: Candidate[]) {
-  return [...candidates].sort(
-    (first, second) =>
-      new Date(second.created_at).getTime() - new Date(first.created_at).getTime(),
-  );
+const pageSize = 8;
+
+function getCandidateTime(candidate: Candidate) {
+  return new Date(candidate.created_at).getTime();
+}
+
+function getSearchScore(candidate: Candidate, searchTerm: string) {
+  const normalizedTerm = searchTerm.trim().toLowerCase();
+
+  if (!normalizedTerm) {
+    return 0;
+  }
+
+  const name = candidate.full_name.toLowerCase();
+  const position = candidate.applied_position.toLowerCase();
+  const words = normalizedTerm.split(/\s+/).filter(Boolean);
+  let score = 0;
+
+  if (name === normalizedTerm) {
+    score += 100;
+  }
+
+  if (position === normalizedTerm) {
+    score += 80;
+  }
+
+  if (name.startsWith(normalizedTerm)) {
+    score += 50;
+  }
+
+  if (position.startsWith(normalizedTerm)) {
+    score += 40;
+  }
+
+  if (name.includes(normalizedTerm)) {
+    score += 25;
+  }
+
+  if (position.includes(normalizedTerm)) {
+    score += 20;
+  }
+
+  for (const word of words) {
+    if (name.includes(word)) {
+      score += 8;
+    }
+
+    if (position.includes(word)) {
+      score += 6;
+    }
+  }
+
+  return score;
+}
+
+function sortCandidates(candidates: Candidate[], searchTerm: string) {
+  return [...candidates].sort((first, second) => {
+    const firstScore = getSearchScore(first, searchTerm);
+    const secondScore = getSearchScore(second, searchTerm);
+
+    if (firstScore !== secondScore) {
+      return secondScore - firstScore;
+    }
+
+    const createdAtDifference = getCandidateTime(second) - getCandidateTime(first);
+
+    if (createdAtDifference !== 0) {
+      return createdAtDifference;
+    }
+
+    return second.id.localeCompare(first.id);
+  });
+}
+
+function mergeCandidates(
+  currentCandidates: Candidate[],
+  incomingCandidates: Candidate[],
+  searchTerm: string,
+) {
+  const candidateMap = new Map<string, Candidate>();
+
+  for (const candidate of currentCandidates) {
+    candidateMap.set(candidate.id, candidate);
+  }
+
+  for (const candidate of incomingCandidates) {
+    candidateMap.set(candidate.id, candidate);
+  }
+
+  return sortCandidates([...candidateMap.values()], searchTerm);
 }
 
 function sanitizeFileName(fileName: string) {
@@ -54,56 +157,195 @@ function sanitizeFileName(fileName: string) {
     .replace(/-+/g, "-");
 }
 
+function sanitizeSearchTerm(searchTerm: string) {
+  return searchTerm.trim().replace(/[,%]/g, " ");
+}
+
+function toEndOfDayIso(dateValue: string) {
+  const date = new Date(`${dateValue}T23:59:59.999`);
+  return date.toISOString();
+}
+
+function candidateMatchesFilters(
+  candidate: Candidate,
+  filters: {
+    searchTerm: string;
+    status: CandidateStatus | "all";
+    dateFrom: string;
+    dateTo: string;
+  },
+) {
+  const searchTerm = filters.searchTerm.trim().toLowerCase();
+  const candidateTime = getCandidateTime(candidate);
+
+  if (
+    searchTerm &&
+    !candidate.full_name.toLowerCase().includes(searchTerm) &&
+    !candidate.applied_position.toLowerCase().includes(searchTerm)
+  ) {
+    return false;
+  }
+
+  if (filters.status !== "all" && candidate.status !== filters.status) {
+    return false;
+  }
+
+  if (filters.dateFrom && candidateTime < new Date(`${filters.dateFrom}T00:00:00`).getTime()) {
+    return false;
+  }
+
+  if (filters.dateTo && candidateTime > new Date(`${filters.dateTo}T23:59:59.999`).getTime()) {
+    return false;
+  }
+
+  return true;
+}
+
 export function Dashboard() {
   const { signOut, user } = useAuth();
   const [candidates, setCandidates] = useState<Candidate[]>([]);
+  const [analytics, setAnalytics] = useState<AnalyticsResponse | null>(null);
   const [fullName, setFullName] = useState("");
   const [appliedPosition, setAppliedPosition] = useState("");
   const [resumeFile, setResumeFile] = useState<File | null>(null);
+  const [searchTerm, setSearchTerm] = useState("");
+  const [statusFilter, setStatusFilter] = useState<CandidateStatus | "all">("all");
+  const [dateFrom, setDateFrom] = useState("");
+  const [dateTo, setDateTo] = useState("");
+  const [nextCursor, setNextCursor] = useState<CandidateCursor | null>(null);
+  const [hasMoreCandidates, setHasMoreCandidates] = useState(false);
   const [loadingCandidates, setLoadingCandidates] = useState(true);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [loadingAnalytics, setLoadingAnalytics] = useState(true);
   const [submitting, setSubmitting] = useState(false);
   const [updatingStatusId, setUpdatingStatusId] = useState<string | null>(null);
   const [error, setError] = useState("");
   const [successMessage, setSuccessMessage] = useState("");
 
+  const filters = useMemo(
+    () => ({
+      searchTerm,
+      status: statusFilter,
+      dateFrom,
+      dateTo,
+    }),
+    [dateFrom, dateTo, searchTerm, statusFilter],
+  );
+
   const candidateCountLabel = useMemo(() => {
     if (candidates.length === 1) {
-      return "1 candidate";
+      return "1 candidate loaded";
     }
 
-    return `${candidates.length} candidates`;
+    return `${candidates.length} candidates loaded`;
   }, [candidates.length]);
+
+  const fetchAnalytics = useCallback(async () => {
+    setLoadingAnalytics(true);
+
+    const { data, error: analyticsError } =
+      await supabase.functions.invoke<AnalyticsResponse>("analytics", {
+        method: "GET",
+      });
+
+    if (analyticsError) {
+      setError(analyticsError.message);
+    } else if (data?.error) {
+      setError(data.error);
+    } else {
+      setAnalytics(data ?? null);
+    }
+
+    setLoadingAnalytics(false);
+  }, []);
+
+  const fetchCandidatePage = useCallback(
+    async (options?: { cursor?: CandidateCursor | null; append?: boolean }) => {
+      const append = options?.append ?? false;
+      const cursor = options?.cursor ?? null;
+
+      if (append) {
+        setLoadingMore(true);
+      } else {
+        setLoadingCandidates(true);
+      }
+
+      setError("");
+
+      let query = supabase
+        .from("candidates")
+        .select("id, user_id, full_name, applied_position, status, resume_url, created_at")
+        .order("created_at", { ascending: false })
+        .order("id", { ascending: false })
+        .limit(pageSize + 1);
+
+      const cleanedSearchTerm = sanitizeSearchTerm(filters.searchTerm);
+
+      if (cleanedSearchTerm) {
+        query = query.or(
+          `full_name.ilike.%${cleanedSearchTerm}%,applied_position.ilike.%${cleanedSearchTerm}%`,
+        );
+      }
+
+      if (filters.status !== "all") {
+        query = query.eq("status", filters.status);
+      }
+
+      if (filters.dateFrom) {
+        query = query.gte("created_at", new Date(`${filters.dateFrom}T00:00:00`).toISOString());
+      }
+
+      if (filters.dateTo) {
+        query = query.lte("created_at", toEndOfDayIso(filters.dateTo));
+      }
+
+      if (cursor) {
+        query = query.or(
+          `created_at.lt.${cursor.created_at},and(created_at.eq.${cursor.created_at},id.lt.${cursor.id})`,
+        );
+      }
+
+      const { data, error: fetchError } = await query;
+
+      if (fetchError) {
+        setError(fetchError.message);
+      } else {
+        const pageRows = ((data ?? []) as Candidate[]).slice(0, pageSize);
+        const finalRow = pageRows.at(-1) ?? null;
+
+        setCandidates((currentCandidates) =>
+          append ? mergeCandidates(currentCandidates, pageRows, filters.searchTerm) : sortCandidates(pageRows, filters.searchTerm),
+        );
+        setNextCursor(finalRow ? { created_at: finalRow.created_at, id: finalRow.id } : null);
+        setHasMoreCandidates((data?.length ?? 0) > pageSize);
+      }
+
+      setLoadingCandidates(false);
+      setLoadingMore(false);
+    },
+    [filters],
+  );
 
   useEffect(() => {
     if (!user) {
       return;
     }
 
-    let active = true;
+    fetchCandidatePage();
+  }, [fetchCandidatePage, user]);
 
-    async function fetchCandidates() {
-      setLoadingCandidates(true);
-      setError("");
-
-      const { data, error: fetchError } = await supabase
-        .from("candidates")
-        .select("id, user_id, full_name, applied_position, status, resume_url, created_at")
-        .order("created_at", { ascending: false });
-
-      if (!active) {
-        return;
-      }
-
-      if (fetchError) {
-        setError(fetchError.message);
-      } else {
-        setCandidates((data ?? []) as Candidate[]);
-      }
-
-      setLoadingCandidates(false);
+  useEffect(() => {
+    if (!user) {
+      return;
     }
 
-    fetchCandidates();
+    fetchAnalytics();
+  }, [fetchAnalytics, user]);
+
+  useEffect(() => {
+    if (!user) {
+      return;
+    }
 
     const channel = supabase
       .channel(`candidates:${user.id}`)
@@ -122,35 +364,46 @@ export function Dashboard() {
             }
 
             const nextCandidate = payload.new;
-            const existingIndex = currentCandidates.findIndex(
-              (candidate) => candidate.id === nextCandidate.id,
-            );
+            const currentCandidateIds = new Set(currentCandidates.map((candidate) => candidate.id));
 
-            if (existingIndex === -1) {
-              return sortCandidates([nextCandidate, ...currentCandidates]);
+            if (
+              !candidateMatchesFilters(nextCandidate, filters) &&
+              currentCandidateIds.has(nextCandidate.id)
+            ) {
+              return currentCandidates.filter((candidate) => candidate.id !== nextCandidate.id);
             }
 
-            const nextCandidates = [...currentCandidates];
-            nextCandidates[existingIndex] = nextCandidate;
+            if (!candidateMatchesFilters(nextCandidate, filters)) {
+              return currentCandidates;
+            }
 
-            return sortCandidates(nextCandidates);
+            return mergeCandidates(currentCandidates, [nextCandidate], filters.searchTerm);
           });
+
+          fetchAnalytics();
         },
       )
       .subscribe();
 
     return () => {
-      active = false;
       supabase.removeChannel(channel);
     };
-  }, [user]);
+  }, [fetchAnalytics, filters, user]);
 
   function handleFileChange(event: ChangeEvent<HTMLInputElement>) {
     setResumeFile(event.target.files?.[0] ?? null);
   }
 
+  function handleResetFilters() {
+    setSearchTerm("");
+    setStatusFilter("all");
+    setDateFrom("");
+    setDateTo("");
+  }
+
   async function handleAddCandidate(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    const form = event.currentTarget;
 
     if (!user) {
       return;
@@ -220,7 +473,7 @@ export function Dashboard() {
       setFullName("");
       setAppliedPosition("");
       setResumeFile(null);
-      event.currentTarget.reset();
+      form?.reset();
       setSuccessMessage("Candidate added successfully.");
     } catch (submissionError) {
       setError(
@@ -261,6 +514,64 @@ export function Dashboard() {
         </button>
       </header>
 
+      <section className={styles.analyticsPanel} aria-labelledby="analytics-title">
+        <div className={styles.analyticsHeader}>
+          <div>
+            <p className={styles.label}>Statistics</p>
+            <h2 id="analytics-title">Analytics</h2>
+          </div>
+          <button type="button" onClick={fetchAnalytics}>
+            Refresh
+          </button>
+        </div>
+
+        {loadingAnalytics ? (
+          <p className={styles.mutedText}>Loading analytics...</p>
+        ) : analytics ? (
+          <div className={styles.analyticsGrid}>
+            <article className={styles.metricCard}>
+              <span>Total candidates</span>
+              <strong>{analytics.totalCandidates}</strong>
+            </article>
+
+            <article className={styles.metricCard}>
+              <span>Newest in 7 days</span>
+              <strong>{analytics.newestCandidatesCount}</strong>
+            </article>
+
+            <article className={styles.wideMetricCard}>
+              <span>Status ratios</span>
+              <div className={styles.ratioList}>
+                {analytics.statusRatios.map((statusRatio) => (
+                  <p key={statusRatio.status}>
+                    <span>{statusLabels[statusRatio.status]}</span>
+                    <strong>{Math.round(statusRatio.ratio * 100)}%</strong>
+                  </p>
+                ))}
+              </div>
+            </article>
+
+            <article className={styles.wideMetricCard}>
+              <span>Top positions</span>
+              {analytics.topPositions.length === 0 ? (
+                <p className={styles.compactMutedText}>No positions yet.</p>
+              ) : (
+                <ol className={styles.positionList}>
+                  {analytics.topPositions.map((position) => (
+                    <li key={position.position}>
+                      <span>{position.position}</span>
+                      <strong>{position.count}</strong>
+                    </li>
+                  ))}
+                </ol>
+              )}
+            </article>
+          </div>
+        ) : (
+          <p className={styles.mutedText}>Analytics unavailable.</p>
+        )}
+      </section>
+
       <section className={styles.contentGrid}>
         <form className={styles.formPanel} onSubmit={handleAddCandidate}>
           <div className={styles.sectionHeader}>
@@ -292,7 +603,13 @@ export function Dashboard() {
 
           <label>
             Resume PDF
-            <input accept="application/pdf" name="resume" onChange={handleFileChange} required type="file" />
+            <input
+              accept="application/pdf"
+              name="resume"
+              onChange={handleFileChange}
+              required
+              type="file"
+            />
           </label>
 
           {error ? <p className={styles.error}>{error}</p> : null}
@@ -312,48 +629,116 @@ export function Dashboard() {
             <span className={styles.realtimeBadge}>Realtime on</span>
           </div>
 
+          <form className={styles.filterBar} onSubmit={(event) => event.preventDefault()}>
+            <label>
+              Search
+              <input
+                onChange={(event) => setSearchTerm(event.target.value)}
+                placeholder="Name or position"
+                type="search"
+                value={searchTerm}
+              />
+            </label>
+
+            <label>
+              Status
+              <select
+                onChange={(event) => setStatusFilter(event.target.value as CandidateStatus | "all")}
+                value={statusFilter}
+              >
+                <option value="all">All statuses</option>
+                {candidateStatuses.map((status) => (
+                  <option key={status} value={status}>
+                    {statusLabels[status]}
+                  </option>
+                ))}
+              </select>
+            </label>
+
+            <label>
+              From
+              <input
+                onChange={(event) => setDateFrom(event.target.value)}
+                type="date"
+                value={dateFrom}
+              />
+            </label>
+
+            <label>
+              To
+              <input
+                onChange={(event) => setDateTo(event.target.value)}
+                type="date"
+                value={dateTo}
+              />
+            </label>
+
+            <button type="button" onClick={handleResetFilters}>
+              Reset
+            </button>
+          </form>
+
           {loadingCandidates ? (
             <p className={styles.mutedText}>Loading candidates...</p>
           ) : candidates.length === 0 ? (
-            <p className={styles.mutedText}>No candidates yet.</p>
+            <p className={styles.mutedText}>No candidates match the current filters.</p>
           ) : (
-            <div className={styles.candidateList}>
-              {candidates.map((candidate) => (
-                <article className={styles.candidateItem} key={candidate.id}>
-                  <div className={styles.candidateMain}>
-                    <h3>{candidate.full_name}</h3>
-                    <p>{candidate.applied_position}</p>
-                  </div>
+            <>
+              <div className={styles.candidateList}>
+                {candidates.map((candidate) => (
+                  <article className={styles.candidateItem} key={candidate.id}>
+                    <div className={styles.candidateMain}>
+                      <h3>{candidate.full_name}</h3>
+                      <p>{candidate.applied_position}</p>
+                      <time dateTime={candidate.created_at}>
+                        {new Intl.DateTimeFormat("en", {
+                          dateStyle: "medium",
+                          timeStyle: "short",
+                        }).format(new Date(candidate.created_at))}
+                      </time>
+                    </div>
 
-                  <div className={styles.candidateControls}>
-                    <label>
-                      Status
-                      <select
-                        disabled={updatingStatusId === candidate.id}
-                        onChange={(event) =>
-                          handleStatusChange(candidate.id, event.target.value as CandidateStatus)
-                        }
-                        value={candidate.status}
-                      >
-                        {candidateStatuses.map((status) => (
-                          <option key={status} value={status}>
-                            {statusLabels[status]}
-                          </option>
-                        ))}
-                      </select>
-                    </label>
+                    <div className={styles.candidateControls}>
+                      <label>
+                        Status
+                        <select
+                          disabled={updatingStatusId === candidate.id}
+                          onChange={(event) =>
+                            handleStatusChange(candidate.id, event.target.value as CandidateStatus)
+                          }
+                          value={candidate.status}
+                        >
+                          {candidateStatuses.map((status) => (
+                            <option key={status} value={status}>
+                              {statusLabels[status]}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
 
-                    {candidate.resume_url ? (
-                      <a href={candidate.resume_url} rel="noreferrer" target="_blank">
-                        View resume
-                      </a>
-                    ) : (
-                      <span className={styles.noResume}>No resume</span>
-                    )}
-                  </div>
-                </article>
-              ))}
-            </div>
+                      {candidate.resume_url ? (
+                        <a href={candidate.resume_url} rel="noreferrer" target="_blank">
+                          View resume
+                        </a>
+                      ) : (
+                        <span className={styles.noResume}>No resume</span>
+                      )}
+                    </div>
+                  </article>
+                ))}
+              </div>
+
+              {hasMoreCandidates ? (
+                <button
+                  className={styles.loadMoreButton}
+                  disabled={loadingMore}
+                  onClick={() => fetchCandidatePage({ cursor: nextCursor, append: true })}
+                  type="button"
+                >
+                  {loadingMore ? "Loading..." : "Load more"}
+                </button>
+              ) : null}
+            </>
           )}
         </section>
       </section>
